@@ -1,341 +1,583 @@
+from __future__ import annotations
+import json
 import os
-import subprocess
+import queue
+import shutil
 import tempfile
 import threading
 import uuid
-import queue
-import json
-import shutil
-import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
+import faiss
+import numpy as np
+import scipy.sparse as sp
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-
-import fitz  # PyMuPDF
-from docx import Document
-from PIL import Image
-import pytesseract
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import faiss
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import scipy.sparse as sp
+from ripper import PromptRipper
 
-# ----------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------
-UPLOAD_FOLDER = tempfile.mkdtemp()
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-MODEL_NAME = 'all-MiniLM-L6-v2'   # Lightweight semantic model
+UPLOAD_FOLDER = Path(tempfile.mkdtemp(prefix="prompt_ripper_"))
+MAX_FILE_SIZE = 50 * 1024 * 1024
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+ENABLE_RERANKER = os.getenv("ENABLE_RERANKER", "1") == "1"
 
-# Global job storage
+app = FastAPI(title="Prompt Ripper Pro — Forensic Edition")
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
 
-# Global search indices (in-memory)
-semantic_model: Optional[SentenceTransformer] = None
-tfidf_vectorizer: Optional[TfidfVectorizer] = None
-faiss_index: Optional[faiss.Index] = None
-tfidf_matrix: Optional[sp.csr_matrix] = None
-results_metadata: List[Dict[str, Any]] = []
-
-app = FastAPI(title="Prompt Ripper Pro")
-templates = Jinja2Templates(directory="templates")
+embedding_model: Optional[SentenceTransformer] = None
+reranker: Optional[CrossEncoder] = None
+semantic_index: Optional[faiss.Index] = None
+semantic_documents: List[Dict[str, Any]] = []
+bm25: Optional[BM25Okapi] = None
+bm25_tokens: List[List[str]] = []
+char_vectorizer: Optional[TfidfVectorizer] = None
+char_matrix: Optional[sp.csr_matrix] = None
+index_lock = threading.RLock()
 
 class IndexRequest(BaseModel):
     prompts: List[Dict[str, Any]]
 
-# ----------------------------------------------------------------------
-# Text extraction functions
-# ----------------------------------------------------------------------
-def extract_text_from_pdf(file_path: str) -> str:
-    text = ""
-    with fitz.open(file_path) as doc:
-        for page in doc:
-            text += page.get_text()
-    return text
-
-def extract_text_from_docx(file_path: str) -> str:
-    doc = Document(file_path)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-def extract_text_from_image(file_path: str) -> str:
-    img = Image.open(file_path)
-    return pytesseract.image_to_string(img)
-
-def extract_text_from_plain(file_path: str) -> str:
-    for enc in ["utf-8", "cp1252", "latin-1"]:
-        try:
-            with open(file_path, 'r', encoding=enc) as f:
-                return f.read()
-        except UnicodeDecodeError:
-            continue
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        return f.read()
-
-def extract_text(file_path: str) -> str:
-    ext = Path(file_path).suffix.lower()
-    if ext == '.pdf':
-        return extract_text_from_pdf(file_path)
-    elif ext == '.docx':
-        return extract_text_from_docx(file_path)
-    elif ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
-        return extract_text_from_image(file_path)
-    else:
-        return extract_text_from_plain(file_path)
-
-# ----------------------------------------------------------------------
-# Search index building
-# ----------------------------------------------------------------------
-def build_search_index(prompts: List[Dict[str, Any]]):
-    """Build semantic (FAISS) and lexical (TF‑IDF) indices in memory."""
-    global semantic_model, tfidf_vectorizer, faiss_index, tfidf_matrix, results_metadata
-
-    results_metadata = prompts
-    if not prompts:
-        return
-
-    # Semantic index
-    if semantic_model is None:
-        semantic_model = SentenceTransformer(MODEL_NAME)
-    embeddings = semantic_model.encode([p['content'] for p in prompts], convert_to_numpy=True)
-    dimension = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatL2(dimension)
-    faiss_index.add(embeddings.astype(np.float32))
-
-    # Lexical index
-    tfidf_vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
-    tfidf_matrix = tfidf_vectorizer.fit_transform([p['content'] for p in prompts])
-
-# ----------------------------------------------------------------------
-# Background processing
-# ----------------------------------------------------------------------
-def run_ripper(job_id: str, input_path: str, output_path: str,
-               similarity: float, min_utility: int, keep_duplicates: bool):
-    q = jobs[job_id]['queue']
-    q.put({'type': 'status', 'message': 'Starting text extraction...'})
-
-    cmd = [
-        sys.executable, 'ripper.py', input_path, output_path,
-        '--similarity', str(similarity),
-        '--min-utility', str(min_utility)
-    ]
-    if keep_duplicates:
-        cmd.append('--keep-duplicates')
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        universal_newlines=True
+def lexical_tokens(text: str) -> List[str]:
+    import re
+    # Do not delete stopwords. Negation and instruction words matter in prompts.
+    return re.findall(
+        r"[A-Za-z0-9_./\\:{}<>\[\]-]+",
+        text.casefold(),
     )
 
-    for line in iter(process.stderr.readline, ''):
-        if line:
-            line = line.rstrip()
-            if line:
-                q.put({'type': 'progress', 'message': line})
+def searchable_text(prompt: Dict[str, Any]) -> str:
+    flags = " ".join(prompt.get("risk_flags", []))
+    detectors = " ".join(prompt.get("detector_hits", []))
+    return (
+        f"Heading: {prompt.get('heading_path', '')}\n"
+        f"Type: {prompt.get('source_type', '')}\n"
+        f"Risk flags: {flags}\n"
+        f"Detector evidence: {detectors}\n"
+        f"Prompt:\n{prompt.get('content', '')}"
+    )
 
-    process.wait()
-    if process.returncode != 0:
-        q.put({'type': 'error', 'message': f'Script failed with exit code {process.returncode}'})
-        jobs[job_id]['status'] = 'error'
-        return
+def semantic_chunks(
+    prompt: Dict[str, Any],
+    max_words: int = 220,
+    overlap_words: int = 45,
+) -> List[str]:
+    base = searchable_text(prompt)
+    words = base.split()
+    if len(words) <= max_words:
+        return [base]
+    chunks = [base]  # preserve whole-prompt representation
+    step = max_words - overlap_words
+    for start in range(0, len(words), step):
+        chunk = words[start : start + max_words]
+        if not chunk:
+            break
+        chunks.append(" ".join(chunk))
+        if start + max_words >= len(words):
+            break
+    return chunks
 
+def build_search_index(prompts: List[Dict[str, Any]]) -> None:
+    global semantic_index
+    global semantic_documents
+    global bm25
+    global bm25_tokens
+    global char_vectorizer
+    global char_matrix
+    global embedding_model
+    with index_lock:
+        semantic_documents = []
+        if not prompts:
+            semantic_index = None
+            bm25 = None
+            char_vectorizer = None
+            char_matrix = None
+            return
+        if embedding_model is None:
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        semantic_texts = []
+        for prompt_idx, prompt in enumerate(prompts):
+            chunks = semantic_chunks(prompt)
+            for chunk_idx, chunk in enumerate(chunks):
+                semantic_texts.append(chunk)
+                semantic_documents.append(
+                    {
+                        "prompt_idx": prompt_idx,
+                        "chunk_idx": chunk_idx,
+                        "is_whole_prompt": chunk_idx == 0,
+                    }
+                )
+        vectors = embedding_model.encode(
+            semantic_texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        ).astype(np.float32)
+        semantic_index = faiss.IndexFlatIP(vectors.shape[1])
+        semantic_index.add(vectors)
+        lexical_documents = [searchable_text(p) for p in prompts]
+        bm25_tokens = [lexical_tokens(text) for text in lexical_documents]
+        bm25 = BM25Okapi(bm25_tokens)
+        char_vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=1,
+            sublinear_tf=True,
+            norm="l2",
+        )
+        char_matrix = char_vectorizer.fit_transform(lexical_documents)
+
+def rank_semantic(
+    query: str,
+    prompts: List[Dict[str, Any]],
+    candidate_count: int,
+) -> List[Dict[str, Any]]:
+    if semantic_index is None or embedding_model is None:
+        return []
+    vector = embedding_model.encode(
+        [query],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).astype(np.float32)
+    search_k = min(
+        max(candidate_count * 5, candidate_count),
+        len(semantic_documents),
+    )
+    scores, indices = semantic_index.search(vector, search_k)
+    parent_scores: Dict[int, Dict[str, float]] = {}
+    for score, index in zip(scores[0], indices[0]):
+        if index < 0 or index >= len(semantic_documents):
+            continue
+        metadata = semantic_documents[index]
+        prompt_idx = metadata["prompt_idx"]
+        value = float(score)
+        state = parent_scores.setdefault(
+            prompt_idx,
+            {
+                "max_chunk": -1.0,
+                "whole": -1.0,
+            },
+        )
+        state["max_chunk"] = max(state["max_chunk"], value)
+        if metadata["is_whole_prompt"]:
+            state["whole"] = max(state["whole"], value)
+    results = []
+    for prompt_idx, state in parent_scores.items():
+        whole = max(state["whole"], 0.0)
+        score = state["max_chunk"] + 0.15 * whole
+        results.append(
+            {
+                "prompt_idx": prompt_idx,
+                "score": score,
+            }
+        )
+    results.sort(key=lambda x: -x["score"])
+    return results[:candidate_count]
+
+def rank_bm25(
+    query: str,
+    candidate_count: int,
+) -> List[Dict[str, Any]]:
+    if bm25 is None:
+        return []
+    scores = bm25.get_scores(lexical_tokens(query))
+    indices = np.argsort(scores)[::-1]
+    out = []
+    for idx in indices[:candidate_count]:
+        out.append(
+            {
+                "prompt_idx": int(idx),
+                "score": float(scores[idx]),
+            }
+        )
+    return out
+
+def rank_char(
+    query: str,
+    candidate_count: int,
+) -> List[Dict[str, Any]]:
+    if char_vectorizer is None or char_matrix is None:
+        return []
+    query_vec = char_vectorizer.transform([query])
+    scores = (query_vec @ char_matrix.T).toarray().ravel()
+    indices = np.argsort(scores)[::-1]
+    out = []
+    for idx in indices[:candidate_count]:
+        if scores[idx] <= 0:
+            continue
+        out.append(
+            {
+                "prompt_idx": int(idx),
+                "score": float(scores[idx]),
+            }
+        )
+    return out
+
+def reciprocal_rank_fusion(
+    rankings: List[List[Dict[str, Any]]],
+    k: int = 60,
+) -> List[Dict[str, Any]]:
+    fused: Dict[int, Dict[str, Any]] = {}
+    for ranking_name, ranking in enumerate(rankings):
+        for rank, item in enumerate(ranking, 1):
+            prompt_idx = item["prompt_idx"]
+            entry = fused.setdefault(
+                prompt_idx,
+                {
+                    "prompt_idx": prompt_idx,
+                    "rrf_score": 0.0,
+                    "source_ranks": {},
+                    "source_scores": {},
+                },
+            )
+            entry["rrf_score"] += 1.0 / (k + rank)
+            entry["source_ranks"][str(ranking_name)] = rank
+            entry["source_scores"][str(ranking_name)] = item["score"]
+    return sorted(
+        fused.values(),
+        key=lambda x: -x["rrf_score"],
+    )
+
+def rerank_results(
+    query: str,
+    fused: List[Dict[str, Any]],
+    prompts: List[Dict[str, Any]],
+    final_k: int,
+) -> List[Dict[str, Any]]:
+    global reranker
+    candidates = fused[: max(final_k * 3, 30)]
+    if not ENABLE_RERANKER:
+        return candidates[:final_k]
     try:
-        with open(output_path, 'r', encoding='utf-8') as f:
-            results = json.load(f)
-        jobs[job_id]['result'] = results
-        jobs[job_id]['status'] = 'completed'
+        if reranker is None:
+            reranker = CrossEncoder(RERANK_MODEL)
+        pairs = [
+            [query, searchable_text(prompts[item["prompt_idx"]])]
+            for item in candidates
+        ]
+        rerank_scores = reranker.predict(pairs)
+        for item, score in zip(candidates, rerank_scores):
+            item["rerank_score"] = float(score)
+        candidates.sort(key=lambda x: -x["rerank_score"])
+    except Exception:
+        # Retrieval remains functional when the optional reranker is unavailable.
+        pass
+    return candidates[:final_k]
 
-        # Build search indices in background thread to avoid blocking
-        build_search_index(results)
+def hybrid_search(
+    query: str,
+    prompts: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    broad_k = min(max(top_k * 4, 40), max(len(prompts), 1))
+    semantic = rank_semantic(query, prompts, broad_k)
+    lexical = rank_bm25(query, broad_k)
+    char = rank_char(query, broad_k)
+    fused = reciprocal_rank_fusion(
+        [semantic, lexical, char],
+        k=60,
+    )
+    ranked = rerank_results(
+        query,
+        fused,
+        prompts,
+        top_k,
+    )
+    output = []
+    for rank, item in enumerate(ranked, 1):
+        output.append(
+            {
+                "rank": rank,
+                "prompt": prompts[item["prompt_idx"]],
+                "score": item.get(
+                    "rerank_score",
+                    item["rrf_score"],
+                ),
+                "rrf_score": item["rrf_score"],
+                "source_ranks": item["source_ranks"],
+                "source_scores": item["source_scores"],
+                "method": "hybrid",
+            }
+        )
+    return output
 
-        # Clean up temporary files now that processing is complete
+def worker(
+    job_id: str,
+    input_path: Path,
+    min_prompt_probability: float,
+    min_utility: int,
+) -> None:
+    job = jobs[job_id]
+    q = job["queue"]
+    try:
+        q.put(
+            {
+                "type": "status",
+                "message": "Extracting structured document evidence...",
+            }
+        )
+        engine = PromptRipper(
+            minimum_prompt_probability=min_prompt_probability,
+            minimum_utility=min_utility,
+            keep_low_probability=True,
+        )
+        report = engine.process(input_path)
+        q.put(
+            {
+                "type": "progress",
+                "message": (
+                    f"Detected {report['metadata']['accepted_prompt_count']} "
+                    "prompt candidates."
+                ),
+            }
+        )
+        q.put(
+            {
+                "type": "status",
+                "message": "Building BM25, character and semantic indices...",
+            }
+        )
+        build_search_index(report["prompts"])
+        with jobs_lock:
+            job["result"] = report
+            job["status"] = "completed"
+        q.put(
+            {
+                "type": "result",
+                "data": report,
+            }
+        )
+        q.put(
+            {
+                "type": "done",
+                "message": "Forensic processing complete.",
+            }
+        )
+    except Exception as exc:
+        with jobs_lock:
+            job["status"] = "error"
+            job["error"] = str(exc)
+        q.put(
+            {
+                "type": "error",
+                "message": str(exc),
+            }
+        )
+    finally:
         try:
-            os.remove(input_path)
-            os.remove(output_path)
-            # Also remove the original uploaded file if it still exists
-            original_input = input_path.replace('_extracted.txt', Path(input_path).suffix)
-            if os.path.exists(original_input):
-                os.remove(original_input)
-        except Exception as cleanup_err:
-            q.put({'type': 'progress', 'message': f'Cleanup warning: {cleanup_err}'})
+            input_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-        q.put({'type': 'result', 'data': results})
-        q.put({'type': 'done', 'message': 'Processing complete.'})
-    except Exception as e:
-        q.put({'type': 'error', 'message': f'Error reading results: {str(e)}'})
-        jobs[job_id]['status'] = 'error'
-
-# ----------------------------------------------------------------------
-# API Endpoints
-# ----------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request},
+    )
 
 @app.post("/upload")
-async def upload_file(
+async def upload(
     file: UploadFile = File(...),
-    similarity: float = Form(0.92),
+    min_prompt_probability: float = Form(0.35),
     min_utility: int = Form(0),
-    keep_duplicates: bool = Form(False)
 ):
+    if not 0 <= min_prompt_probability <= 1:
+        raise HTTPException(
+            400,
+            "min_prompt_probability must be between 0 and 1",
+        )
+    allowed = {
+        ".txt",
+        ".md",
+        ".json",
+        ".csv",
+        ".log",
+        ".pdf",
+        ".docx",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".webp",
+    }
+    filename = file.filename or "upload.txt"
+    extension = Path(filename).suffix.lower()
+    if extension not in allowed:
+        raise HTTPException(
+            400,
+            f"Unsupported file extension: {extension}",
+        )
     job_id = str(uuid.uuid4())
-    ext = Path(file.filename).suffix.lower()
-    allowed_exts = ['.txt', '.md', '.json', '.csv', '.log', '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.tiff', '.bmp']
-    if ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
-
-    # Save uploaded file
-    original_input = os.path.join(UPLOAD_FOLDER, f"{job_id}{ext}")
-    with open(original_input, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Extract text
-    try:
-        text = extract_text(original_input)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
-
-    # Save text as a temporary .txt file for ripper.py
-    text_file_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_extracted.txt")
-    with open(text_file_path, 'w', encoding='utf-8') as f:
-        f.write(text)
-
-    output_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_output.json")
-
+    target = UPLOAD_FOLDER / f"{job_id}{extension}"
+    size = 0
+    with target.open("wb") as output:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_FILE_SIZE:
+                output.close()
+                target.unlink(missing_ok=True)
+                raise HTTPException(
+                    413,
+                    "File exceeds 50 MB limit.",
+                )
+            output.write(chunk)
     with jobs_lock:
         jobs[job_id] = {
-            'queue': queue.Queue(),
-            'status': 'running',
-            'result': None,
-            'error': None,
+            "queue": queue.Queue(),
+            "status": "running",
+            "result": None,
+            "error": None,
         }
-
     thread = threading.Thread(
-        target=run_ripper,
-        args=(job_id, text_file_path, output_path, similarity, min_utility, keep_duplicates)
+        target=worker,
+        args=(
+            job_id,
+            target,
+            min_prompt_probability,
+            min_utility,
+        ),
+        daemon=True,
     )
-    thread.daemon = True
     thread.start()
-
-    return JSONResponse({"job_id": job_id}, status_code=202)
+    return JSONResponse(
+        {"job_id": job_id},
+        status_code=202,
+    )
 
 @app.get("/stream/{job_id}")
 async def stream(job_id: str):
     if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Invalid job ID")
-
-    async def event_generator():
-        q = jobs[job_id]['queue']
+        raise HTTPException(404, "Invalid job ID")
+    async def events():
+        q = jobs[job_id]["queue"]
         while True:
             try:
-                message = q.get(timeout=30)
+                message = q.get(timeout=25)
                 yield f"data: {json.dumps(message)}\n\n"
-                if message['type'] in ('done', 'error'):
+                if message["type"] in {"done", "error"}:
                     break
             except queue.Empty:
                 yield ": keep-alive\n\n"
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+    )
 
 @app.get("/results/{job_id}")
-async def get_results(job_id: str):
+async def results(job_id: str):
     if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Invalid job ID")
+        raise HTTPException(404, "Invalid job ID")
     job = jobs[job_id]
-    if job['status'] == 'completed':
-        return JSONResponse(job['result'])
-    elif job['status'] == 'error':
-        raise HTTPException(status_code=500, detail=job.get('error', 'Processing error'))
-    else:
-        return JSONResponse({"status": "processing"}, status_code=202)
+    if job["status"] == "completed":
+        return JSONResponse(job["result"])
+    if job["status"] == "error":
+        raise HTTPException(
+            500,
+            job.get("error") or "Processing failed",
+        )
+    return JSONResponse(
+        {"status": "processing"},
+        status_code=202,
+    )
 
 @app.get("/search")
-async def search_prompts(
+async def search(
     q: str = Query(..., min_length=1),
-    method: str = Query("semantic", regex="^(semantic|lexical|both)$"),
-    top_k: int = Query(10, ge=1, le=50)
+    top_k: int = Query(10, ge=1, le=50),
 ):
-    if not results_metadata:
-        raise HTTPException(status_code=404, detail="No prompts indexed yet. Process a file first.")
-
-    results = []
-    if method in ("semantic", "both") and faiss_index is not None:
-        query_embedding = semantic_model.encode([q], convert_to_numpy=True).astype(np.float32)
-        distances, indices = faiss_index.search(query_embedding, top_k)
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx < len(results_metadata):
-                results.append({
-                    "prompt": results_metadata[idx],
-                    "score": float(dist),
-                    "method": "semantic"
-                })
-
-    if method in ("lexical", "both") and tfidf_vectorizer is not None and tfidf_matrix is not None:
-        query_vec = tfidf_vectorizer.transform([q])
-        similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
-        top_indices = similarities.argsort()[-top_k:][::-1]
-        for idx in top_indices:
-            if similarities[idx] > 0:
-                results.append({
-                    "prompt": results_metadata[idx],
-                    "score": float(similarities[idx]),
-                    "method": "lexical"
-                })
-
-    if method == "semantic":
-        results.sort(key=lambda x: x['score'])
-    elif method == "lexical":
-        results.sort(key=lambda x: -x['score'])
-    else:  # both
-        results.sort(key=lambda x: (x['method'], x['score'] if x['method']=='semantic' else -x['score']))
-
-    return JSONResponse(results[:top_k])
+    completed = [
+        job
+        for job in jobs.values()
+        if job.get("status") == "completed"
+        and job.get("result")
+    ]
+    if not completed:
+        raise HTTPException(
+            404,
+            "No processed prompt collection is currently indexed.",
+        )
+    prompts = completed[-1]["result"]["prompts"]
+    if not prompts:
+        return JSONResponse([])
+    with index_lock:
+        output = hybrid_search(
+            q,
+            prompts,
+            top_k,
+        )
+    return JSONResponse(output)
 
 @app.post("/build_index")
-async def build_index_endpoint(req: IndexRequest):
-    build_search_index(req.prompts)
-    return JSONResponse({"status": "index built"})
+async def build_index(request: IndexRequest):
+    build_search_index(request.prompts)
+    return JSONResponse(
+        {
+            "status": "index built",
+            "prompt_count": len(request.prompts),
+        }
+    )
 
 @app.get("/health")
-async def health_check():
-    """Real healthcheck: verifies that the temporary directory exists and is writable."""
-    checks = {}
-    if os.path.isdir(UPLOAD_FOLDER) and os.access(UPLOAD_FOLDER, os.W_OK):
-        checks['temp_dir'] = 'ok'
-    else:
-        checks['temp_dir'] = 'error: upload folder missing or not writable'
+async def health():
+    checks = {
+        "upload_folder": UPLOAD_FOLDER.is_dir(),
+        "ripper_module": True,
+        "tesseract": False,
+        "semantic_model": embedding_model is not None,
+    }
     try:
         pytesseract.get_tesseract_version()
-        checks['tesseract'] = 'ok'
-    except Exception as e:
-        checks['tesseract'] = f'warning: {str(e)}'
-    if os.path.isfile('ripper.py'):
-        checks['ripper_script'] = 'ok'
-    else:
-        checks['ripper_script'] = 'error: ripper.py not found'
-
-    critical_fail = any(v.startswith('error') for v in checks.values())
-    if critical_fail:
-        return JSONResponse({"status": "unhealthy", "checks": checks}, status_code=500)
-    return JSONResponse({"status": "healthy", "checks": checks}, status_code=200)
+        checks["tesseract"] = True
+    except Exception:
+        pass
+    critical = (
+        checks["upload_folder"]
+        and checks["ripper_module"]
+    )
+    return JSONResponse(
+        {
+            "status": "healthy" if critical else "unhealthy",
+            "checks": checks,
+        },
+        status_code=200 if critical else 500,
+    )
 
 @app.on_event("startup")
-async def startup_event():
-    # Ensure upload folder exists
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    # Do not pre-load the semantic model here; load it lazily on first search.
+async def startup():
+    global embedding_model
+    UPLOAD_FOLDER.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    try:
+        embedding_model = SentenceTransformer(
+            EMBEDDING_MODEL,
+        )
+    except Exception:
+        embedding_model = None
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        log_level="info",
+    )
