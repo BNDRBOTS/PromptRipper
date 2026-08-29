@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prompt Ripper Pro - Extract and Analyze Prompts</title>
+    <meta name="description" content="Upload files, extract prompts with fuzzy matching, risk scoring, and semantic search. Supports PDF, DOCX, images, and text.">
+    <meta property="og:title" content="Prompt Ripper Pro">
+    <meta property="og:description" content="Extract, analyze, and search prompts from any document.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://prompt-ripper.example.com">
+    <meta property="og:image" content="/static/logo.svg">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #f8f9fa;
+            --card-bg: #ffffff;
+            --text: #212529;
+            --border: #dee2e6;
+            --log-bg: #ffffff;
+            --log-text: #212529;
+            --risk-high: #dc3545;
+            --risk-medium: #fd7e14;
+            --risk-low: #ffc107;
+            --risk-none: #28a745;
+        }
+        [data-theme="dark"] {
+            --bg: #121212;
+            --card-bg: #1e1e1e;
+            --text: #e0e0e0;
+            --border: #333;
+            --log-bg: #1e1e1e;
+            --log-text: #e0e0e0;
+        }
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .card {
+            background-color: var(--card-bg);
+            border-color: var(--border);
+            transition: background-color 0.3s, border-color 0.3s;
+        }
+        .card-header {
+            background-color: rgba(0,0,0,0.03);
+            border-bottom: 1px solid var(--border);
+        }
+        [data-theme="dark"] .card-header {
+            background-color: rgba(255,255,255,0.05);
+        }
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: 8px;
+            padding: 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background-color: var(--card-bg);
+        }
+        .drop-zone.dragover {
+            border-color: #007bff;
+            background-color: rgba(0,123,255,0.1);
+        }
+        .progress-log {
+            height: 200px;
+            overflow-y: auto;
+            background: var(--log-bg);
+            color: var(--log-text);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 0.9em;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .risk-high { color: var(--risk-high) !important; font-weight: bold; }
+        .risk-medium { color: var(--risk-medium) !important; font-weight: bold; }
+        .risk-low { color: var(--risk-low) !important; font-weight: bold; }
+        .risk-none { color: var(--risk-none) !important; }
+        .table-responsive { max-height: 600px; }
+        .content-preview {
+            max-width: 300px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .search-box { margin-bottom: 20px; }
+        .btn-outline-secondary {
+            color: var(--text);
+            border-color: var(--border);
+        }
+        .btn-outline-secondary:hover {
+            background-color: rgba(0,0,0,0.1);
+        }
+        [data-theme="dark"] .btn-outline-secondary:hover {
+            background-color: rgba(255,255,255,0.1);
+        }
+        .form-control, .form-select {
+            background-color: var(--card-bg);
+            color: var(--text);
+            border-color: var(--border);
+        }
+        .form-control:focus, .form-select:focus {
+            background-color: var(--card-bg);
+            color: var(--text);
+            border-color: #007bff;
+            box-shadow: none;
+        }
+        .table {
+            color: var(--text);
+        }
+        .table-striped tbody tr:nth-of-type(odd) {
+            background-color: rgba(0,0,0,0.02);
+        }
+        [data-theme="dark"] .table-striped tbody tr:nth-of-type(odd) {
+            background-color: rgba(255,255,255,0.02);
+        }
+        .theme-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+        @media (max-width: 768px) {
+            .container { padding: 0 12px; }
+            .drop-zone { padding: 1.5rem; }
+            .btn { font-size: 0.9rem; }
+        }
+    </style>
+</head>
+<body>
+    <button id="themeToggle" class="btn btn-sm btn-outline-secondary theme-toggle" aria-label="Toggle dark mode">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path>
+        </svg>
+    </button>
+
+    <div class="container mt-4">
+        <header class="mb-4">
+            <h1 class="display-5">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="me-2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                Prompt Ripper Pro
+            </h1>
+            <p class="lead">Upload, extract, and analyze prompts with fuzzy matching and semantic search.</p>
+        </header>
+
+        <div class="row g-4">
+            <div class="col-lg-5">
+                <section class="card mb-3">
+                    <div class="card-header">
+                        <h2 class="h5 mb-0">Upload File</h2>
+                    </div>
+                    <div class="card-body">
+                        <div id="dropZone" class="drop-zone mb-3">
+                            <p class="mb-1">Drag & drop your file here</p>
+                            <p class="text-muted">Supported: TXT, MD, JSON, CSV, PDF, DOCX, PNG, JPG, TIFF</p>
+                            <button id="browseBtn" class="btn btn-outline-primary">Browse Files</button>
+                            <input type="file" id="fileInput" class="d-none" accept=".txt,.md,.json,.csv,.log,.pdf,.docx,.png,.jpg,.jpeg,.tiff,.bmp">
+                        </div>
+                        <div id="fileInfo" class="mb-3 d-none">
+                            <strong>Selected file:</strong> <span id="fileName"></span>
+                        </div>
+                        <button id="clearBtn" class="btn btn-secondary btn-sm mb-3">Clear</button>
+                    </div>
+                </section>
+
+                <section class="card mb-3">
+                    <div class="card-header">
+                        <h2 class="h5 mb-0">Options</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label for="similarity" class="form-label">Similarity Threshold (0.0 – 1.0)</label>
+                            <input type="number" class="form-control" id="similarity" value="0.92" min="0" max="1" step="0.01">
+                        </div>
+                        <div class="mb-3">
+                            <label for="minUtility" class="form-label">Minimum Utility Score</label>
+                            <input type="number" class="form-control" id="minUtility" value="0" min="0" step="1">
+                        </div>
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="keepDuplicates">
+                            <label class="form-check-label" for="keepDuplicates">Keep Duplicates</label>
+                        </div>
+                        <button id="processBtn" class="btn btn-primary w-100" disabled>Process File</button>
+                    </div>
+                </section>
+
+                <section class="card mb-3">
+                    <div class="card-header">
+                        <h2 class="h5 mb-0">Search Extracted Prompts</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group search-box">
+                            <input type="text" id="searchQuery" class="form-control" placeholder="Enter search query...">
+                            <select id="searchMethod" class="form-select" style="max-width: 120px;">
+                                <option value="semantic">Semantic</option>
+                                <option value="lexical">Lexical</option>
+                                <option value="both">Both</option>
+                            </select>
+                            <button id="searchBtn" class="btn btn-outline-secondary">Search</button>
+                        </div>
+                        <div id="searchResults"></div>
+                    </div>
+                </section>
+            </div>
+
+            <div class="col-lg-7">
+                <section class="card mb-3">
+                    <div class="card-header">
+                        <h2 class="h5 mb-0">Progress Log</h2>
+                    </div>
+                    <div class="card-body">
+                        <div id="progressLog" class="progress-log"></div>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h2 class="h5 mb-0">Results</h2>
+                        <button id="downloadResultsBtn" class="btn btn-sm btn-success" disabled>Download JSON</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="resultsContainer">
+                            <p class="text-muted">No results yet.</p>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.4.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            let selectedFile = null;
+            let currentJobId = null;
+            let eventSource = null;
+            let resultsData = null;
+
+            // Theme toggle
+            const themeToggle = document.getElementById('themeToggle');
+            themeToggle.addEventListener('click', () => {
+                const currentTheme = document.documentElement.getAttribute('data-theme');
+                const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+                document.documentElement.setAttribute('data-theme', newTheme);
+                localStorage.setItem('theme', newTheme);
+            });
+            // Set initial theme from localStorage or system preference
+            const storedTheme = localStorage.getItem('theme');
+            if (storedTheme) {
+                document.documentElement.setAttribute('data-theme', storedTheme);
+            } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+
+            // Drag and drop handlers
+            const dropZone = document.getElementById('dropZone');
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('dragover');
+            });
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    handleFile(files[0]);
+                }
+            });
+
+            // Browse button
+            $('#browseBtn').click(() => {
+                $('#fileInput').click();
+            });
+            $('#fileInput').change((e) => {
+                if (e.target.files.length > 0) {
+                    handleFile(e.target.files[0]);
+                }
+            });
+
+            // Clear button
+            $('#clearBtn').click(() => {
+                clearFile();
+            });
+
+            // Process button
+            $('#processBtn').click(() => {
+                if (selectedFile) {
+                    startProcessing();
+                }
+            });
+
+            // Download results
+            $('#downloadResultsBtn').click(() => {
+                if (resultsData) {
+                    const blob = new Blob([JSON.stringify(resultsData, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'prompt_ripper_results.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }
+            });
+
+            // Search
+            $('#searchBtn').click(() => {
+                performSearch();
+            });
+            $('#searchQuery').keypress(function(e) {
+                if (e.which === 13) {
+                    performSearch();
+                }
+            });
+
+            function handleFile(file) {
+                selectedFile = file;
+                $('#fileName').text(file.name);
+                $('#fileInfo').removeClass('d-none');
+                $('#processBtn').prop('disabled', false);
+                $('#resultsContainer').html('<p class="text-muted">Ready to process.</p>');
+                $('#downloadResultsBtn').prop('disabled', true);
+                if (eventSource) eventSource.close();
+                $('#progressLog').empty();
+                resultsData = null;
+            }
+
+            function clearFile() {
+                selectedFile = null;
+                $('#fileInfo').addClass('d-none');
+                $('#fileInput').val('');
+                $('#processBtn').prop('disabled', true);
+                $('#resultsContainer').html('<p class="text-muted">No results yet.</p>');
+                $('#downloadResultsBtn').prop('disabled', true);
+                $('#progressLog').empty();
+                if (eventSource) eventSource.close();
+                resultsData = null;
+            }
+
+            function appendLog(message, type = 'info') {
+                const logDiv = $('#progressLog');
+                const timestamp = new Date().toLocaleTimeString();
+                const icon = type === 'error' ? '✖' : type === 'progress' ? '●' : '✔';
+                logDiv.append(`<div>${icon} [${timestamp}] ${message}</div>`);
+                logDiv.scrollTop(logDiv[0].scrollHeight);
+            }
+
+            function startProcessing() {
+                if (!selectedFile) return;
+
+                $('#processBtn').prop('disabled', true);
+                $('#browseBtn').prop('disabled', true);
+                $('#clearBtn').prop('disabled', true);
+                $('#progressLog').empty();
+                appendLog('Uploading and starting processing...', 'status');
+
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+                formData.append('similarity', $('#similarity').val());
+                formData.append('min_utility', $('#minUtility').val());
+                formData.append('keep_duplicates', $('#keepDuplicates').is(':checked'));
+
+                $.ajax({
+                    url: '/upload',
+                    type: 'POST',
+                    data: formData,
+                    processData: false,
+                    contentType: false,
+                    success: function(response) {
+                        currentJobId = response.job_id;
+                        appendLog('Processing started. Listening to progress...', 'status');
+                        openEventStream(currentJobId);
+                    },
+                    error: function(xhr, status, error) {
+                        appendLog('Upload failed: ' + error, 'error');
+                        enableControls();
+                    }
+                });
+            }
+
+            function openEventStream(jobId) {
+                eventSource = new EventSource(`/stream/${jobId}`);
+                eventSource.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'progress') {
+                        appendLog(data.message, 'progress');
+                    } else if (data.type === 'status') {
+                        appendLog(data.message, 'status');
+                    } else if (data.type === 'result') {
+                        resultsData = data.data;
+                        appendLog('Results received. Building search index...', 'status');
+                        renderResults(resultsData);
+                        // The index is already built in background; call anyway for safety
+                        fetch('/build_index', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({prompts: resultsData})
+                        }).catch(err => console.error('Index build failed:', err));
+                    } else if (data.type === 'done') {
+                        appendLog(data.message, 'done');
+                        eventSource.close();
+                        enableControls();
+                    } else if (data.type === 'error') {
+                        appendLog(data.message, 'error');
+                        eventSource.close();
+                        enableControls();
+                    }
+                };
+                eventSource.onerror = function(e) {
+                    appendLog('EventSource error. Connection may be lost.', 'error');
+                    eventSource.close();
+                    enableControls();
+                };
+            }
+
+            function enableControls() {
+                $('#processBtn').prop('disabled', false);
+                $('#browseBtn').prop('disabled', false);
+                $('#clearBtn').prop('disabled', false);
+            }
+
+            function renderResults(data) {
+                if (!data || data.length === 0) {
+                    $('#resultsContainer').html('<div class="alert alert-warning">No prompts found.</div>');
+                    return;
+                }
+                let html = `<div class="table-responsive"><table class="table table-striped table-sm">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Risk</th>
+                            <th>Utility</th>
+                            <th>Source</th>
+                            <th>Heading</th>
+                            <th>Content</th>
+                        </tr>
+                    </thead>
+                    <tbody>`;
+                data.forEach(item => {
+                    const riskClass = `risk-${item.red_team_risk}`;
+                    const riskBadge = `<span class="${riskClass}">${item.red_team_risk.toUpperCase()}</span>`;
+                    const flags = item.risk_flags.length ? `<br><small class="text-muted">${item.risk_flags.join(', ')}</small>` : '';
+                    const contentPreview = item.content.length > 200 
+                        ? item.content.substring(0, 200) + '...' 
+                        : item.content;
+                    html += `<tr>
+                        <td>${item.id}</td>
+                        <td>${riskBadge}${flags}</td>
+                        <td>${item.utility_score}</td>
+                        <td>${item.source_type}</td>
+                        <td>${item.heading_path || 'Root'}</td>
+                        <td class="content-preview" title="${escapeHtml(item.content)}">${escapeHtml(contentPreview)}</td>
+                    </tr>`;
+                });
+                html += '</tbody></table></div>';
+                $('#resultsContainer').html(html);
+                $('#downloadResultsBtn').prop('disabled', false);
+            }
+
+            function performSearch() {
+                const query = $('#searchQuery').val().trim();
+                if (!query) return;
+                const method = $('#searchMethod').val();
+                const topK = 10;
+                $('#searchResults').html('<p class="text-muted">Searching...</p>');
+                $.getJSON('/search', {q: query, method: method, top_k: topK}, function(data) {
+                    if (data.length === 0) {
+                        $('#searchResults').html('<div class="alert alert-warning">No matching prompts.</div>');
+                    } else {
+                        let html = '<ul class="list-group">';
+                        data.forEach(item => {
+                            const p = item.prompt;
+                            const riskClass = `risk-${p.red_team_risk}`;
+                            html += `<li class="list-group-item">
+                                <strong>${p.id}</strong> (${p.red_team_risk.toUpperCase()}, score: ${item.score.toFixed(3)})
+                                <br><span class="content-preview">${escapeHtml(p.content.substring(0, 200))}...</span>
+                            </li>`;
+                        });
+                        html += '</ul>';
+                        $('#searchResults').html(html);
+                    }
+                }).fail(function() {
+                    $('#searchResults').html('<div class="alert alert-danger">Search failed. Make sure you have processed a file first.</div>');
+                });
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+        });
+    </script>
+</body>
+</html>
