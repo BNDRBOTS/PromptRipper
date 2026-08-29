@@ -400,14 +400,9 @@
                         appendLog(data.message, 'status');
                     } else if (data.type === 'result') {
                         resultsData = data.data;
-                        appendLog('Results received. Building search index...', 'status');
+                        appendLog('Results received. Rendering table...', 'status');
                         renderResults(resultsData);
-                        // The index is already built in background; call anyway for safety
-                        fetch('/build_index', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({prompts: resultsData})
-                        }).catch(err => console.error('Index build failed:', err));
+                        // Index already built in backend; no additional call needed
                     } else if (data.type === 'done') {
                         appendLog(data.message, 'done');
                         eventSource.close();
