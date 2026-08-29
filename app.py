@@ -13,7 +13,6 @@ from typing import Optional, List, Dict, Any
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
@@ -48,7 +47,6 @@ results_metadata: List[Dict[str, Any]] = []
 
 app = FastAPI(title="Prompt Ripper Pro")
 templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class IndexRequest(BaseModel):
     prompts: List[Dict[str, Any]]
@@ -170,7 +168,6 @@ def run_ripper(job_id: str, input_path: str, output_path: str,
             if os.path.exists(original_input):
                 os.remove(original_input)
         except Exception as cleanup_err:
-            # Log but do not fail the job
             q.put({'type': 'progress', 'message': f'Cleanup warning: {cleanup_err}'})
 
         q.put({'type': 'result', 'data': results})
@@ -337,12 +334,7 @@ async def health_check():
 async def startup_event():
     # Ensure upload folder exists
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    # Pre-load semantic model to avoid download during first request
-    global semantic_model
-    try:
-        semantic_model = SentenceTransformer(MODEL_NAME)
-    except Exception as e:
-        print(f"Warning: could not pre-load semantic model: {e}")
+    # Do not pre-load the semantic model here; load it lazily on first search.
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
