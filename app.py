@@ -6,6 +6,7 @@ import uuid
 import queue
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -48,6 +49,9 @@ results_metadata: List[Dict[str, Any]] = []
 app = FastAPI(title="Prompt Ripper Pro")
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+class IndexRequest(BaseModel):
+    prompts: List[Dict[str, Any]]
 
 # ----------------------------------------------------------------------
 # Text extraction functions
@@ -120,7 +124,7 @@ def run_ripper(job_id: str, input_path: str, output_path: str,
     q.put({'type': 'status', 'message': 'Starting text extraction...'})
 
     cmd = [
-        'python', 'ripper.py', input_path, output_path,
+        sys.executable, 'ripper.py', input_path, output_path,
         '--similarity', str(similarity),
         '--min-utility', str(min_utility)
     ]
@@ -157,6 +161,18 @@ def run_ripper(job_id: str, input_path: str, output_path: str,
         # Build search indices in background thread to avoid blocking
         build_search_index(results)
 
+        # Clean up temporary files now that processing is complete
+        try:
+            os.remove(input_path)
+            os.remove(output_path)
+            # Also remove the original uploaded file if it still exists
+            original_input = input_path.replace('_extracted.txt', Path(input_path).suffix)
+            if os.path.exists(original_input):
+                os.remove(original_input)
+        except Exception as cleanup_err:
+            # Log but do not fail the job
+            q.put({'type': 'progress', 'message': f'Cleanup warning: {cleanup_err}'})
+
         q.put({'type': 'result', 'data': results})
         q.put({'type': 'done', 'message': 'Processing complete.'})
     except Exception as e:
@@ -184,13 +200,13 @@ async def upload_file(
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
 
     # Save uploaded file
-    input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}{ext}")
-    with open(input_path, "wb") as buffer:
+    original_input = os.path.join(UPLOAD_FOLDER, f"{job_id}{ext}")
+    with open(original_input, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     # Extract text
     try:
-        text = extract_text(input_path)
+        text = extract_text(original_input)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
 
@@ -290,8 +306,8 @@ async def search_prompts(
     return JSONResponse(results[:top_k])
 
 @app.post("/build_index")
-async def build_index_endpoint(prompts: List[Dict[str, Any]]):
-    build_search_index(prompts)
+async def build_index_endpoint(req: IndexRequest):
+    build_search_index(req.prompts)
     return JSONResponse({"status": "index built"})
 
 @app.get("/health")
@@ -319,7 +335,15 @@ async def health_check():
 
 @app.on_event("startup")
 async def startup_event():
+    # Ensure upload folder exists
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    # Pre-load semantic model to avoid download during first request
+    global semantic_model
+    try:
+        semantic_model = SentenceTransformer(MODEL_NAME)
+    except Exception as e:
+        print(f"Warning: could not pre-load semantic model: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
+    port = int(os.getenv("PORT", 5000))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
